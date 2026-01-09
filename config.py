@@ -8,7 +8,7 @@ DB_CONFIG = {
     'host': 'localhost',
     'port': 3306,
     'user': 'root',
-    'password': 'your_password',
+    'password': '121024',
     'database': 'supermarket_db',
     'charset': 'utf8mb4'
 }

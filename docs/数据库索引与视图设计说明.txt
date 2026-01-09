@@ -1,0 +1,348 @@
+超市前台销售系统 - 数据库索引与视图设计说明
+组员1负责（收银管理与总体设计）
+
+
+一、索引设计
+
+索引是提升数据库查询性能的关键手段。本系统根据业务查询场景，对核心表建立了合理的索引结构，在保证查询效率的同时避免过度索引带来的写入性能损耗。
+
+1.1 商品表（goods）索引设计
+
+(1) PRIMARY - 主键索引 - goods_id字段
+    自增主键，唯一标识商品记录，所有关联查询的基础。
+
+(2) idx_barcode - 唯一索引 - barcode字段
+    商品条码全局唯一，收银扫码时通过条码快速定位商品。这是收银模块中查询频率最高的索引，扫码查询时间复杂度O(1)，可实现毫秒级响应。收银员每次扫描商品条码时，系统执行 SELECT * FROM goods WHERE barcode = ? 语句，该索引确保即使商品表数据量达到数万条，查询速度依然稳定。
+
+(3) idx_category - 普通索引 - category_id字段
+    按分类查询商品时使用，支持商品管理中的分类筛选功能。商品管理员在查看某一分类下的所有商品时，通过此索引避免全表扫描，提升分类商品列表的加载速度。
+
+(4) idx_shelf_status - 普通索引 - shelf_status字段
+    按上架状态筛选商品。收银时只查询在架商品（on_shelf），库存管理时按状态分类展示。该索引支持快速筛选出待上架、在架、已下架等不同状态的商品，是收银可售商品视图的重要支撑。
+
+1.2 订单表（order_info）索引设计
+
+(1) PRIMARY - 主键索引 - order_id字段
+    自增主键，唯一标识订单记录。
+
+(2) idx_order_no - 唯一索引 - order_no字段
+    订单号全局唯一，格式为ORD+时间戳+随机数。退货查询、小票打印、订单追溯时通过订单号快速定位。顾客凭小票退货时，售后人员输入订单号即可秒级查询到原订单信息。
+
+(3) idx_member - 普通索引 - member_id字段
+    按会员查询消费记录，支持会员消费历史查询功能。会员管理模块中查看某会员的所有消费记录时使用此索引，配合时间索引可实现高效的会员消费分析。
+
+(4) idx_status - 普通索引 - order_status字段
+    按订单状态筛选。挂单调单功能需要快速获取所有状态为hanged的订单；退货查询需要筛选completed状态的订单；统计报表需要排除cancelled状态的订单。该索引是多个业务场景的基础支撑。
+
+(5) idx_create_time - 普通索引 - create_time字段
+    按时间范围查询订单，支持销售统计、日报表、月报表等功能。统计模块中按日期范围查询销售数据时，此索引可大幅提升查询效率，避免对历史订单的全表扫描。
+
+1.3 库存表（inventory）索引设计
+
+(1) PRIMARY - 主键索引 - inventory_id字段
+    自增主键。
+
+(2) UNIQUE - 唯一索引 - goods_id字段
+    每个商品只有一条库存记录，保证数据一致性。收银结算时检查库存、扣减库存都通过此索引快速定位，确保库存操作的高效性。该唯一约束同时防止了同一商品出现多条库存记录的数据异常。
+
+(3) idx_status - 普通索引 - stock_status字段
+    按库存状态筛选。库存预警功能需要快速定位stock_shortage（库存短缺）和shelf_shortage（在架短缺）状态的商品，此索引支持预警列表的快速加载。
+
+1.4 其他表索引设计
+
+会员表（member）：
+- idx_card_no：会员卡号唯一索引，收银时通过卡号快速识别会员身份
+- idx_phone：手机号索引，支持通过手机号查询会员信息
+- idx_level：会员等级索引，按等级统计会员分布情况
+
+订单明细表（order_detail）：
+- idx_order：订单ID索引，查询某订单的所有商品明细时使用
+
+支付记录表（payment_record）：
+- idx_order：订单ID索引，查询订单的支付方式和金额时使用
+
+退货记录表（return_record）：
+- idx_return_no：退货单号唯一索引，退货查询时使用
+- idx_order：原订单ID索引，关联查询原订单信息
+
+
+二、视图设计
+
+视图是对复杂查询的封装，简化业务层代码，提高代码可维护性。本系统根据不同角色的业务需求，设计了多个专用视图。
+
+2.1 收银员视图（组员1负责）
+
+(1) v_goods_on_sale - 在架可售商品视图
+
+用途：收银时快速查询可售商品，只返回上架状态且库存大于零的商品。
+
+视图定义：
+CREATE VIEW v_goods_on_sale AS
+SELECT g.goods_id, g.barcode, g.goods_name, g.price, g.discount,
+       g.discount_start, g.discount_end, g.unit, g.is_weighted,
+       i.on_shelf_num, gc.category_name
+FROM goods g
+JOIN inventory i ON g.goods_id = i.goods_id
+JOIN goods_category gc ON g.category_id = gc.category_id
+WHERE g.shelf_status = 'on_shelf' AND i.on_shelf_num > 0;
+
+返回字段说明：
+- goods_id：商品ID，用于后续的库存扣减和订单明细关联
+- barcode：商品条码，扫码枪输入的原始数据
+- goods_name：商品名称，显示在收银界面的购物车列表中
+- price：销售单价，计算小计金额的基础
+- discount：当前折扣，如0.8表示8折，用于促销商品
+- discount_start/end：折扣有效期，系统自动判断折扣是否生效
+- unit：计量单位（个/kg/瓶等），显示在商品信息中
+- is_weighted：是否散装称重商品，决定是否弹出称重输入框
+- on_shelf_num：在架库存数量，用于库存充足性检查
+- category_name：商品分类名称，辅助信息展示
+
+应用场景：
+收银扫码时调用此视图查询商品，自动过滤下架和缺货商品，简化收银逻辑层代码。收银员无需关心商品状态判断，视图已在数据库层面完成筛选。
+
+(2) v_member_info - 会员信息视图
+
+用途：关联会员表和等级规则表，返回会员基本信息及对应的折扣率，简化会员查询逻辑。
+
+视图定义：
+CREATE VIEW v_member_info AS
+SELECT m.member_id, m.card_no, m.name, m.phone, m.level_code,
+       m.total_points, mlr.discount_rate, mlr.points_rate
+FROM member m
+JOIN member_level_rule mlr ON m.level_code = mlr.level_code
+WHERE m.status = 'active';
+
+返回字段说明：
+- member_id：会员ID，订单关联使用
+- card_no：会员卡号，格式为VIP+8位数字
+- name：会员姓名，显示在收银界面
+- phone：手机号，备用查询条件
+- level_code：等级代码（normal/silver/gold）
+- total_points：当前积分，可用于积分抵扣
+- discount_rate：折扣率，如0.95表示95折，直接用于金额计算
+- points_rate：积分比例，每消费1元获得的积分数
+
+应用场景：
+收银时识别会员后，通过此视图一次查询即可获取会员信息和折扣率，无需在业务代码中进行多表关联。系统自动根据会员等级应用对应折扣，计算实付金额。
+
+(3) v_hanged_orders - 挂单订单视图
+
+用途：查询状态为挂单的订单，关联会员表和用户表获取会员姓名和收银员姓名，用于调单功能。
+
+视图定义：
+CREATE VIEW v_hanged_orders AS
+SELECT o.order_id, o.order_no, o.total_amount, o.create_time,
+       m.card_no AS member_card, m.name AS member_name,
+       u.real_name AS cashier_name
+FROM order_info o
+LEFT JOIN member m ON o.member_id = m.member_id
+LEFT JOIN sys_user u ON o.cashier_id = u.user_id
+WHERE o.order_status = 'hanged';
+
+返回字段说明：
+- order_id：订单ID，调单时用于加载订单明细
+- order_no：订单号，显示在挂单列表中
+- total_amount：订单总金额，帮助收银员识别订单
+- create_time：挂单时间，按时间排序显示
+- member_card：会员卡号，可为空（非会员订单）
+- member_name：会员姓名，可为空
+- cashier_name：原收银员姓名，便于交接班时识别
+
+应用场景：
+调单功能显示所有挂单订单列表，收银员可查看自己或所有人的挂单。选择某个挂单后，系统加载订单明细到购物车，继续完成结算。该视图支持收银员交接班场景，新收银员可以接手前一班次的挂单。
+
+2.2 商品管理员视图
+
+(1) v_inventory_warning - 库存预警视图
+筛选库存短缺或在架短缺的商品，用于库存预警功能，提醒商品管理员及时补货。
+
+(2) v_pending_quality_feedback - 待处理质量反馈视图
+查询待处理的质量问题反馈，提醒商品管理员及时处理退货中发现的质量问题。
+
+(3) v_category_tree - 商品分类树视图
+展示商品分类层级结构（课-类-种三级），支持分类管理功能。
+
+2.3 售后管理员视图
+
+(1) v_returnable_orders - 可退货订单视图
+查询7天内已完成的订单，用于退货功能。超过7天的订单不在此视图中显示，符合7天无理由退货的业务规则。
+
+(2) v_return_summary - 退货记录汇总视图
+汇总退货记录信息，包含原订单号、会员信息、退款金额、退货原因等，用于退货查询和统计功能。
+
+2.4 统计报表视图
+
+(1) v_daily_sales - 每日销售汇总视图
+按日期汇总销售数据，包含订单数、总销售额、折扣金额、实收金额，用于日报表功能。
+
+(2) v_goods_sales_rank - 商品销售排行视图
+统计商品销售数量和金额，用于销售排行功能，帮助管理者了解热销商品。
+
+(3) v_member_consume_rank - 会员消费排行视图
+统计会员消费情况，包含消费总额、订单数、积分等，用于会员分析功能。
+
+
+三、数据约束与业务规则
+
+3.1 库存扣减安全机制
+
+问题背景：
+并发场景下，多个收银台同时销售同一商品，如果简单地先查询库存再扣减，可能导致库存出现负数。例如：库存剩余1件，两个收银台同时查询到库存为1，都执行扣减，最终库存变为-1。
+
+解决方案：使用条件更新（Conditional Update）
+
+SQL语句：
+UPDATE inventory 
+SET on_shelf_num = on_shelf_num - ? 
+WHERE goods_id = ? AND on_shelf_num >= ?
+
+执行逻辑：
+1. WHERE条件中增加 on_shelf_num >= 扣减数量 的判断
+2. 只有当前库存足够时才执行更新操作
+3. 通过affected_rows（影响行数）判断是否扣减成功
+4. 若affected_rows = 0，说明库存不足，返回错误提示给收银员
+
+代码实现（cashier_logic.py）：
+sql_stock = """
+    UPDATE inventory SET on_shelf_num = on_shelf_num - %s 
+    WHERE goods_id = %s AND on_shelf_num >= %s
+"""
+for item in items:
+    db.execute(sql_stock, (item["quantity"], item["goods_id"], item["quantity"]))
+
+优势：
+- 原子操作：UPDATE语句本身是原子的，无需额外加锁
+- 数据库层面保证：数据一致性由数据库引擎保证，不依赖应用层逻辑
+- 高并发性能：相比悲观锁方案，条件更新不会阻塞其他事务，性能更优
+
+3.2 订单号生成规则
+
+格式：ORD + 年月日时分秒（14位） + 4位随机数
+示例：ORD202601071345001234
+
+组成部分：
+- 前缀ORD：固定3位，标识这是一个销售订单（区别于退货单RET）
+- 时间戳20260107134500：14位，精确到秒，包含年月日时分秒
+- 随机数1234：4位，范围1000-9999，增加唯一性
+
+代码实现（cashier_logic.py）：
+def generate_order_no():
+    """生成订单号: ORD + 年月日时分秒 + 4位随机数"""
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    random_num = str(random.randint(1000, 9999))
+    return f"ORD{timestamp}{random_num}"
+
+唯一性保证：
+- 时间戳精确到秒，同一秒内理论上最多9000个不同订单号
+- 数据库order_no字段设置UNIQUE约束，作为最后一道防线
+- 极端情况下发生重复时，数据库拒绝插入，系统可捕获异常后重新生成
+
+设计考量：
+- 可读性：从订单号可直接看出下单时间，便于人工核对
+- 排序性：按订单号排序即按时间排序，便于订单管理
+- 长度适中：21位字符，小票打印和人工输入都可接受
+
+3.3 会员卡号生成规则
+
+格式：VIP + 8位数字序号
+示例：VIP00000001、VIP00000002、VIP00012345
+
+生成逻辑：
+- 查询当前最大会员ID
+- 新会员ID = 最大ID + 1
+- 格式化为8位数字，不足8位前面补零
+
+代码实现（member_manage_logic.py）：
+def generate_card_no():
+    """生成会员卡号: VIP + 8位数字"""
+    with DBConnection() as db:
+        db.execute("SELECT MAX(member_id) AS max_id FROM member")
+        result = db.fetchone()
+        next_id = (result["max_id"] or 0) + 1
+        return f"VIP{next_id:08d}"
+
+唯一性保证：
+- 基于自增主键生成，天然保证唯一性
+- 数据库card_no字段设置UNIQUE约束
+
+设计考量：
+- 易记忆：VIP前缀明确标识会员身份，数字序号简单易记
+- 可扩展：8位数字支持最多99999999个会员，满足超市业务需求
+- 易输入：纯数字部分便于收银员手动输入查询
+
+3.4 退货单号生成规则
+
+格式：RET + 年月日时分秒（14位） + 4位随机数
+示例：RET202601071530005678
+
+与订单号规则一致，仅前缀不同（RET代替ORD），便于从单号直接区分业务类型。
+
+3.5 数据完整性约束
+
+外键约束：
+- order_info.member_id 关联 member.member_id（会员可为空，非会员购物）
+- order_info.cashier_id 关联 sys_user.user_id（收银员必填）
+- order_detail.order_id 关联 order_info.order_id（订单明细必须属于某订单）
+- order_detail.goods_id 关联 goods.goods_id（明细必须关联有效商品）
+- inventory.goods_id 关联 goods.goods_id（库存记录必须关联有效商品）
+- return_record.order_id 关联 order_info.order_id（退货必须关联原订单）
+
+枚举约束：
+- order_status：pending_pay（待结账）、hanged（挂单中）、completed（已完成）、cancelled（已撤销）、full_returned（已整单退货）、part_returned（部分退货）
+- payment_type：cash（现金）、bank_card（银行卡）、coupon（赠券）、points（积分）
+- shelf_status：pending_shelf（待上架）、on_shelf（在架）、off_shelf（已下架）、pending_inspect（待质检）、suspend_sale（暂停销售）
+- stock_status：sufficient（充足）、stock_shortage（库存短缺）、shelf_shortage（在架短缺）
+
+默认值约束：
+- order_status 默认 'pending_pay'，新建订单初始状态
+- discount 默认 1.00，表示无折扣
+- total_points 默认 0，新会员初始积分
+- create_time 默认 CURRENT_TIMESTAMP，自动记录创建时间
+
+
+四、性能优化建议
+
+4.1 查询优化
+
+(1) 使用覆盖索引
+对于只需要索引字段的查询，可以避免回表操作，直接从索引中获取数据。
+示例：SELECT barcode, goods_name FROM goods WHERE barcode = ?
+
+(2) 避免SELECT *
+只查询需要的字段，减少数据传输量和内存占用。
+
+(3) 分页查询
+大数据量查询使用LIMIT分页，避免一次加载过多数据导致内存溢出或响应缓慢。
+示例：SELECT * FROM order_info ORDER BY create_time DESC LIMIT 20 OFFSET 0
+
+4.2 写入优化
+
+(1) 批量插入
+多条订单明细使用批量INSERT，减少数据库交互次数，提升写入效率。
+
+(2) 事务控制
+订单创建涉及多表操作（订单表、明细表、支付表、库存表、会员表），使用事务保证数据一致性。任一步骤失败时回滚所有操作，成功时统一提交。
+
+4.3 索引维护
+
+(1) 定期分析表
+执行 ANALYZE TABLE goods, order_info, inventory; 更新统计信息，帮助查询优化器选择最优执行计划。
+
+(2) 监控慢查询
+开启MySQL慢查询日志，定期分析执行时间过长的SQL语句，针对性优化。
+
+
+五、总结
+
+本系统的数据库设计遵循以下原则：
+
+1. 索引设计合理：根据实际查询场景建立索引，在查询效率和写入性能之间取得平衡。核心业务表（商品、订单、库存）的高频查询字段都建立了相应索引。
+
+2. 视图封装复杂查询：将多表关联查询封装为视图，简化业务层代码，提高可维护性。不同角色使用不同视图，实现数据访问的逻辑隔离。
+
+3. 数据约束严格：通过外键约束保证引用完整性，通过唯一约束保证业务数据唯一性，通过枚举约束限制字段取值范围，从数据库层面保证数据质量。
+
+4. 业务规则数据库层实现：库存扣减等关键操作在SQL层面使用条件更新保证原子性，避免并发问题，不依赖应用层加锁。
+
+通过以上设计，系统能够支撑超市日常收银业务的高并发场景，同时保证数据的准确性和一致性。
